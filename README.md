@@ -13,14 +13,14 @@ streamlit run streamlit_app.py
 
 ## Use
 
-1. Upload one or more observed JSON exports and one prediction JSON.
-2. Choose the cell key and numeric metric on each side. AwanAwam exports such as `vga_floorplan_nodes` with `x`, `y`, and `crowd_density` are supported; coordinate pairs are offered as cell keys when present.
-3. Set the relative-error tolerance and compare.
-4. Download the merged observed data as JSON or the per-cell comparison as CSV.
+1. Upload one or more observed JSON exports. The app merges and displays the floorplan data before asking for the prediction.
+2. Upload the prediction JSON.
+3. Click **Compare peak crowd density**. The app automatically matches coordinates (`x`, `y`) or a cell ID and detects fields such as `peak_crowd_density` or AwanAwam's `crowd_density`.
+4. Download the combined observed data as JSON or the comparison as CSV.
 
 Nested JSON exports are searched for a non-empty array of object records. When observed rows overlap, non-empty values from later uploads replace earlier values for the same field; conflicting values are reported. The app processes uploaded files in memory and does not explicitly save them to disk. When hosted remotely, the files are sent to that Streamlit host for processing.
 
-The reported tolerance accuracy is the percentage of matched cells within the selected relative-error threshold. MAE, RMSE, MAPE, and prediction bias are also shown. MAPE excludes observed values of zero; a zero observed value is within tolerance only when its prediction is also zero.
+The reported accuracy is the percentage of matched cells within a 10% relative-error tolerance. MAE, RMSE, MAPE, and prediction bias are also shown. MAPE excludes observed values of zero; a zero observed value is within tolerance only when its prediction is also zero.
 
 ## Related project
 

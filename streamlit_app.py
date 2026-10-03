@@ -12,11 +12,9 @@ import streamlit as st
 st.set_page_config(page_title="Crowd Prediction Validation", layout="wide")
 
 ID_HINTS = ("cell_id", "cellid", "area_id", "areaid", "zone_id", "zoneid", "node_id", "id", "cell", "area")
-METRIC_HINTS = ("crowd_density", "crowd_count", "occupancy", "people_count", "people", "visitors", "count", "density", "value")
+CROWD_DENSITY_FIELDS = ("peak_crowd_density", "crowd_density_peak", "max_crowd_density", "crowd_density", "peak_density", "density_peak")
 ARRAY_HINTS = ("vga_floorplan_nodes", "cells", "areas", "zones", "records", "metrics", "items", "data")
 
-st.title("AwanAwam: Crowd Prediction Validation")
-st.write("Combine observed crowd metrics from multiple JSON files and compare them with a prediction.")
 
 
 def find_record_array(value: Any, path: str = "$", depth: int = 0) -> tuple[str, list[dict[str, Any]]] | None:
@@ -60,37 +58,25 @@ def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def default_index(options: list[str], hints: tuple[str, ...]) -> int:
-    normalized = [option.lower().replace("-", "").replace(" ", "") for option in options]
-    for hint in hints:
-        for index, option in enumerate(normalized):
-            if option == hint:
-                return index
-    for index, option in enumerate(normalized):
-        if any(hint in option for hint in hints):
-            return index
-    return 0
-
-
-def get_key_options(records: list[dict[str, Any]]) -> dict[str, tuple[str, ...]]:
+def find_key_fields(records: list[dict[str, Any]]) -> tuple[str, ...] | None:
     names = fields_in(records)
-    choices = {
-        f"Field: {name}": (name,)
-        for name in names
-        if name.lower().replace("-", "").replace(" ", "") in ID_HINTS or name.lower().endswith("_id")
-    }
     x_field = next((name for name in names if name.lower() in ("x", "x_coord", "x_coordinate")), None)
     y_field = next((name for name in names if name.lower() in ("y", "y_coord", "y_coordinate")), None)
     if x_field and y_field:
-        choices[f"Coordinates: {x_field} + {y_field}"] = (x_field, y_field)
-    if not choices:
-        choices = {f"Field: {name}": (name,) for name in names}
-    return choices
+        return x_field, y_field
+    normalized = {name.lower().replace("-", "").replace(" ", ""): name for name in names}
+    for hint in ID_HINTS:
+        if hint in normalized:
+            return (normalized[hint],)
+    return next(((name,) for name in names if name.lower().endswith("_id")), None)
 
 
-def metric_fields(records: list[dict[str, Any]]) -> list[str]:
-    names = fields_in(records)
-    return [name for name in names if any(is_number(record.get(name)) for record in records)]
+def find_crowd_density_field(records: list[dict[str, Any]]) -> str | None:
+    normalized = {name.lower().replace("-", "").replace(" ", ""): name for name in fields_in(records)}
+    for field in CROWD_DENSITY_FIELDS:
+        if field in normalized and any(is_number(record.get(normalized[field])) for record in records):
+            return normalized[field]
+    return None
 
 
 def canonical_value(value: Any) -> str:
@@ -145,17 +131,12 @@ def index_records(records: list[dict[str, Any]], key_fields: tuple[str, ...]) ->
     return indexed, duplicates, skipped
 
 
-st.header("1. Upload JSON data")
-left, right = st.columns(2)
-with left:
-    st.subheader("Observed metrics")
-    observed_uploads = st.file_uploader("Upload one or more observed JSON files", type=["json"], accept_multiple_files=True, key="observed_uploads")
-with right:
-    st.subheader("Predicted metrics")
-    prediction_upload = st.file_uploader("Upload a prediction JSON file", type=["json"], key="prediction_upload")
+st.title("AwanAwam: Crowd Prediction Validation")
+st.write("Combine actual crowd data, review the floorplan, then compare peak crowd density against a prediction.")
 
+st.header("1. Import actual crowd metrics")
+observed_uploads = st.file_uploader("Upload JSON files", type=["json"], accept_multiple_files=True, key="observed_uploads")
 observed_sources: list[tuple[str, list[dict[str, Any]]]] = []
-prediction_source: tuple[str, list[dict[str, Any]]] | None = None
 for upload in observed_uploads or []:
     try:
         path, records = parse_upload(upload)
@@ -163,6 +144,44 @@ for upload in observed_uploads or []:
         st.caption(f"{upload.name}: {len(records):,} rows found at `{path}`")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         st.error(f"{upload.name}: {error}")
+
+merged: dict[str, dict[str, Any]] = {}
+observed_key_fields: tuple[str, ...] | None = None
+observed_density_field: str | None = None
+duplicates = conflicts = skipped_observed = 0
+if observed_sources:
+    observed_rows = [record for _, records in observed_sources for record in records]
+    observed_key_fields = find_key_fields(observed_rows)
+    observed_density_field = find_crowd_density_field(observed_rows)
+    st.subheader("Combined actual floorplan")
+    if observed_key_fields:
+        merged, duplicates, conflicts, skipped_observed = merge_observed(observed_sources, observed_key_fields)
+        floorplan_rows = list(merged.values())
+        st.caption(f"{len(floorplan_rows):,} unique cells merged by {', '.join(observed_key_fields)}.")
+        if conflicts:
+            st.warning(f"{conflicts:,} overlapping values differed; the last uploaded non-empty value was kept.")
+        if skipped_observed:
+            st.caption(f"{skipped_observed:,} rows without a usable cell key were omitted from the merged view.")
+    else:
+        floorplan_rows = [record for _, records in observed_sources for record in records]
+        st.warning("No coordinate pair or cell ID was found. Showing all rows, but they cannot be merged or compared automatically.")
+
+    floorplan = pd.DataFrame(floorplan_rows)
+    coordinate_fields = find_key_fields(floorplan_rows)
+    if coordinate_fields and len(coordinate_fields) == 2 and observed_density_field:
+        st.scatter_chart(floorplan, x=coordinate_fields[0], y=coordinate_fields[1], color=observed_density_field)
+    st.dataframe(floorplan, hide_index=True, width="stretch")
+    st.download_button(
+        "Download combined actual data",
+        json.dumps(floorplan_rows, ensure_ascii=False, indent=2),
+        "combined-actual-crowd-metrics.json",
+        "application/json",
+    )
+
+st.divider()
+st.header("2. Compare peak crowd density")
+prediction_upload = st.file_uploader("Upload prediction JSON", type=["json"], key="prediction_upload")
+prediction_source: tuple[str, list[dict[str, Any]]] | None = None
 if prediction_upload is not None:
     try:
         path, records = parse_upload(prediction_upload)
@@ -171,54 +190,28 @@ if prediction_upload is not None:
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         st.error(f"{prediction_upload.name}: {error}")
 
-if observed_sources or prediction_source:
-    st.header("2. Match cells and metrics")
-    observed_rows = [record for _, rows in observed_sources for record in rows]
-    predicted_rows = prediction_source[1] if prediction_source else []
-    observed_keys = get_key_options(observed_rows) if observed_rows else {}
-    prediction_keys = get_key_options(predicted_rows) if predicted_rows else {}
-    observed_metrics = metric_fields(observed_rows)
-    predicted_metrics = metric_fields(predicted_rows)
-    usable_fields = bool(observed_keys and prediction_keys and observed_metrics and predicted_metrics)
-    if not observed_keys:
-        observed_keys = {"No usable cell key found": ()}
-    if not prediction_keys:
-        prediction_keys = {"No usable cell key found": ()}
-    if not observed_metrics:
-        observed_metrics = ["No numeric metric field"]
-    if not predicted_metrics:
-        predicted_metrics = ["No numeric metric field"]
-
-    if observed_sources and prediction_source:
-        cols = st.columns(4)
-        with cols[0]:
-            observed_key_label = st.selectbox("Observed cell key", list(observed_keys), index=default_index(list(observed_keys), ID_HINTS), key="observed_key")
-        with cols[1]:
-            observed_metric = st.selectbox("Observed metric", observed_metrics, index=default_index(observed_metrics, METRIC_HINTS), key="observed_metric")
-        with cols[2]:
-            prediction_key_label = st.selectbox("Prediction cell key", list(prediction_keys), index=default_index(list(prediction_keys), ID_HINTS), key="prediction_key")
-        with cols[3]:
-            prediction_metric = st.selectbox("Prediction metric", predicted_metrics, index=default_index(predicted_metrics, METRIC_HINTS), key="prediction_metric")
-
-        tolerance = st.number_input("Accuracy tolerance (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0, help="A cell is accurate when prediction error is within this percentage of its observed value.")
+if observed_sources and prediction_source:
+    predicted_rows = prediction_source[1]
+    prediction_key_fields = find_key_fields(predicted_rows)
+    prediction_density_field = find_crowd_density_field(predicted_rows)
+    if not observed_key_fields or not prediction_key_fields:
+        st.warning("Could not find matching floorplan coordinates or cell IDs in both datasets.")
+    elif not observed_density_field or not prediction_density_field:
+        st.warning("Could not find a peak crowd density field in both datasets.")
+    else:
+        st.caption(f"Comparing `{observed_density_field}` with `{prediction_density_field}`. Cell matching is automatic using {', '.join(observed_key_fields)}. Accuracy uses a 10% tolerance.")
         signatures = (
             tuple((upload.name, hash(upload.getvalue())) for upload in observed_uploads or []),
             (prediction_upload.name, hash(prediction_upload.getvalue())),
-            observed_key_label, observed_metric, prediction_key_label, prediction_metric, tolerance,
         )
-        if not usable_fields:
-            st.warning("The selected JSON records need a usable cell key and at least one numeric metric field on each side.")
-        elif st.button("Compare cells", type="primary"):
-            observed_key_fields = observed_keys[observed_key_label]
-            prediction_key_fields = prediction_keys[prediction_key_label]
-            merged, duplicate_observed, conflicts, skipped_observed = merge_observed(observed_sources, observed_key_fields)
+        if st.button("Compare peak crowd density", type="primary"):
             predictions, duplicate_predictions, skipped_predictions = index_records(predicted_rows, prediction_key_fields)
             results = []
             missing_metric_count = 0
             for key, actual_record in merged.items():
                 predicted_record = predictions.get(key)
-                actual = actual_record.get(observed_metric)
-                predicted = predicted_record.get(prediction_metric) if predicted_record else None
+                actual = actual_record.get(observed_density_field)
+                predicted = predicted_record.get(prediction_density_field) if predicted_record else None
                 if not is_number(actual) or not is_number(predicted):
                     if predicted_record is not None:
                         missing_metric_count += 1
@@ -227,71 +220,56 @@ if observed_sources or prediction_source:
                 relative_error = (0.0 if predicted == 0 else math.inf) if actual == 0 else absolute_error / abs(actual) * 100
                 results.append({
                     "Cell key": ", ".join(str(actual_record.get(field, "")) for field in observed_key_fields),
-                    "Observed": actual, "Predicted": predicted, "Absolute error": absolute_error,
+                    "Actual peak crowd density": actual,
+                    "Predicted peak crowd density": predicted,
+                    "Absolute error": absolute_error,
                     "Relative error (%)": relative_error,
-                    "Within tolerance": relative_error <= tolerance or math.isclose(relative_error, tolerance, rel_tol=1e-12, abs_tol=1e-12),
+                    "Within 10%": relative_error <= 10 or math.isclose(relative_error, 10, rel_tol=1e-12, abs_tol=1e-12),
                 })
             if not results:
-                st.error("No cells matched with numeric values. Check the selected cell keys and metric fields.")
+                st.error("No matching cells had numeric peak crowd density values.")
             else:
                 errors = [row["Absolute error"] for row in results]
-                nonzero_actual = [row for row in results if row["Observed"] != 0]
+                nonzero_actual = [row for row in results if row["Actual peak crowd density"] != 0]
                 payload = {
-                    "rows": results, "merged": list(merged.values()), "tolerance": tolerance,
-                    "duplicates": duplicate_observed, "conflicts": conflicts,
-                    "skipped_observed": skipped_observed, "skipped_prediction": skipped_predictions,
-                    "duplicate_predictions": duplicate_predictions, "missing_metrics": missing_metric_count,
+                    "rows": results,
+                    "duplicates": duplicates,
+                    "conflicts": conflicts,
+                    "missing_metrics": missing_metric_count,
+                    "skipped_observed": skipped_observed,
+                    "skipped_prediction": skipped_predictions,
+                    "duplicate_predictions": duplicate_predictions,
                     "mae": sum(errors) / len(errors),
                     "rmse": math.sqrt(sum(error * error for error in errors) / len(errors)),
                     "mape": sum(row["Relative error (%)"] for row in nonzero_actual) / len(nonzero_actual) if nonzero_actual else None,
-                    "bias": sum(row["Predicted"] - row["Observed"] for row in results) / len(results),
-                    "pass_count": sum(row["Within tolerance"] for row in results),
+                    "pass_count": sum(row["Within 10%"] for row in results),
                 }
                 st.session_state["comparison_payload"] = payload
                 st.session_state["comparison_signature"] = signatures
+
         payload = st.session_state.get("comparison_payload")
         if payload and st.session_state.get("comparison_signature") == signatures:
             rows = payload["rows"]
             accuracy = payload["pass_count"] / len(rows) * 100
-            common_keys = {record_key(record, observed_keys[observed_key_label]) for record in payload["merged"]}
-            predicted_index, _, _ = index_records(predicted_rows, prediction_keys[prediction_key_label])
-            common_keys.discard(None)
-            unmatched = len(common_keys - predicted_index.keys()) + len(predicted_index.keys() - common_keys)
-            st.header("3. Comparison results")
+            prediction_keys, _, _ = index_records(predicted_rows, prediction_key_fields)
+            actual_keys = set(merged)
+            unmatched = len(actual_keys - prediction_keys.keys()) + len(prediction_keys.keys() - actual_keys)
+            st.subheader("Results")
             cards = st.columns(4)
-            cards[0].metric(f"Within {tolerance:g}% tolerance", f'{accuracy:.1f}%', f'{payload["pass_count"]:,} / {len(rows):,} matched cells')
-            cards[1].metric("Matched cells", f"{len(rows):,}")
-            cards[2].metric("Unmatched cells", f"{unmatched:,}")
-            cards[3].metric("Overlapping observed rows", f'{payload["duplicates"]:,}')
-            error_cards = st.columns(4)
-            error_cards[0].metric("MAE", f'{payload["mae"]:,.3f}', help="Mean absolute error")
-            error_cards[1].metric("RMSE", f'{payload["rmse"]:,.3f}', help="Root mean squared error")
-            error_cards[2].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%', help="Mean absolute percentage error; excludes observed zeros")
-            error_cards[3].metric("Bias", f'{payload["bias"]:+,.3f}', help="Average prediction minus observed value")
-            if payload["conflicts"]:
-                st.warning(f'{payload["conflicts"]:,} overlapping observed values differed; the last uploaded non-empty value was kept.')
+            cards[0].metric("Within 10% tolerance", f"{accuracy:.1f}%", f'{payload["pass_count"]:,} / {len(rows):,} matched cells')
+            cards[1].metric("MAE", f'{payload["mae"]:,.3f}')
+            cards[2].metric("RMSE", f'{payload["rmse"]:,.3f}')
+            cards[3].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%')
+            st.caption(f"{unmatched:,} unmatched cells. Bias (prediction minus actual): {sum(row['Predicted peak crowd density'] - row['Actual peak crowd density'] for row in rows) / len(rows):+.3f}.")
             if payload["missing_metrics"]:
-                st.info(f'{payload["missing_metrics"]:,} matching cells were missing a numeric selected metric.')
-            if payload["skipped_observed"] or payload["skipped_prediction"]:
-                st.caption(f'Rows without a usable cell key skipped: {payload["skipped_observed"]:,} observed, {payload["skipped_prediction"]:,} predicted.')
+                st.warning(f'{payload["missing_metrics"]:,} matching cells were missing a numeric density value.')
             if payload["duplicate_predictions"]:
                 st.caption(f'{payload["duplicate_predictions"]:,} repeated prediction keys; the last row was used.')
 
             result_frame = pd.DataFrame(rows).sort_values("Relative error (%)", ascending=False)
-            visible = result_frame.head(500).copy()
-            visible["Relative error (%)"] = visible["Relative error (%)"].map(lambda value: "∞" if math.isinf(value) else f"{value:.2f}%")
-            visible["Within tolerance"] = visible["Within tolerance"].map({True: "Yes", False: "No"})
-            st.subheader("Cell-by-cell results")
-            st.dataframe(visible, hide_index=True, width="stretch")
-            if len(result_frame) > 500:
-                st.caption(f"Showing 500 largest errors out of {len(result_frame):,} matched cells.")
-
-            csv_frame = result_frame.copy()
-            csv_frame["Relative error (%)"] = csv_frame["Relative error (%)"].map(lambda value: "Infinity" if math.isinf(value) else value)
-            download_left, download_right = st.columns(2)
-            download_left.download_button("Download merged observed JSON", json.dumps(payload["merged"], ensure_ascii=False, indent=2), "merged-observed-metrics.json", "application/json")
-            download_right.download_button("Download comparison CSV", csv_frame.to_csv(index=False), "crowd-comparison.csv", "text/csv")
-            st.caption("Accuracy is the share of matched cells within the selected relative-error tolerance. For observed zero, only a predicted zero is within tolerance. MAPE excludes observed zeros.")
-    else:
-        st.info("Add at least one observed JSON file and one prediction JSON file to compare.")
+            result_frame["Relative error (%)"] = result_frame["Relative error (%)"].map(lambda value: "Infinity" if math.isinf(value) else f"{value:.2f}%")
+            result_frame["Within 10%"] = result_frame["Within 10%"].map({True: "Yes", False: "No"})
+            st.dataframe(result_frame, hide_index=True, width="stretch")
+            st.download_button("Download comparison CSV", pd.DataFrame(rows).to_csv(index=False), "peak-crowd-density-comparison.csv", "text/csv")
+            st.caption("A cell counts as accurate when relative error is at most 10%. For actual density zero, only a predicted zero is within tolerance. MAPE excludes zero actual values.")
 
