@@ -365,10 +365,12 @@ if observed_sources and prediction_source:
     elif not observed_density_field or not prediction_density_field:
         st.warning("Could not find a peak crowd density field in both datasets.")
     else:
-        st.caption(f"Comparing `{observed_density_field}` with `{prediction_density_field}`. Cell matching is automatic using {', '.join(observed_key_fields)}. Accuracy uses a 10% tolerance.")
+        tolerance = st.number_input("Accuracy tolerance (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
+        st.caption(f"Comparing `{observed_density_field}` with `{prediction_density_field}`. Cell matching is automatic using {', '.join(observed_key_fields)}.")
         signatures = (
             tuple((upload.name, hash(upload.getvalue())) for upload in observed_uploads or []),
             (prediction_upload.name, hash(prediction_upload.getvalue())),
+            tolerance,
         )
         if st.button("Compare peak crowd density", type="primary"):
             predictions, duplicate_predictions, skipped_predictions = index_records(predicted_rows, prediction_key_fields)
@@ -394,7 +396,7 @@ if observed_sources and prediction_source:
                     "Predicted peak crowd density": predicted,
                     "Absolute error": absolute_error,
                     "Relative error (%)": relative_error,
-                    "Within 10%": relative_error <= 10 or math.isclose(relative_error, 10, rel_tol=1e-12, abs_tol=1e-12),
+                    "Within tolerance": relative_error <= tolerance or math.isclose(relative_error, tolerance, rel_tol=1e-12, abs_tol=1e-12),
                 })
             if not results:
                     st.error("No matching cells had non-zero actual peak crowd density and numeric predictions.")
@@ -410,10 +412,11 @@ if observed_sources and prediction_source:
                     "skipped_observed": skipped_observed,
                     "skipped_prediction": skipped_predictions,
                     "duplicate_predictions": duplicate_predictions,
+                    "tolerance": tolerance,
                     "mae": sum(errors) / len(errors),
                     "rmse": math.sqrt(sum(error * error for error in errors) / len(errors)),
                     "mape": sum(row["Relative error (%)"] for row in nonzero_actual) / len(nonzero_actual) if nonzero_actual else None,
-                    "pass_count": sum(row["Within 10%"] for row in results),
+                    "pass_count": sum(row["Within tolerance"] for row in results),
                 }
                 st.session_state["comparison_payload"] = payload
                 st.session_state["comparison_signature"] = signatures
@@ -427,10 +430,11 @@ if observed_sources and prediction_source:
             unmatched = len(actual_keys - prediction_keys.keys()) + len(prediction_keys.keys() - actual_keys)
             st.subheader("Results")
             cards = st.columns(4)
-            cards[0].metric("Within 10% tolerance", f"{accuracy:.1f}%", f'{payload["pass_count"]:,} / {len(rows):,} matched cells')
-            cards[1].metric("MAE", f'{payload["mae"]:,.3f}')
-            cards[2].metric("RMSE", f'{payload["rmse"]:,.3f}')
-            cards[3].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%')
+            cards[0].metric(f'Within {payload["tolerance"]:g}% tolerance', f"{accuracy:.1f}%", f'{payload["pass_count"]:,} / {len(rows):,} matched cells')
+            cards[1].metric("MAE", f'{payload["mae"]:,.3f}', help="Mean Absolute Error: the average absolute difference between predicted and actual density, in people/m².")
+            cards[2].metric("RMSE", f'{payload["rmse"]:,.3f}', help="Root Mean Squared Error: like MAE, but larger errors count more heavily.")
+            cards[3].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%', help="Mean Absolute Percentage Error: average absolute error as a percentage of actual density. Zero actual values are excluded.")
+            st.caption("MAE is the average absolute error. RMSE emphasizes larger misses. MAPE reports average error relative to non-zero actual values.")
             st.caption(f'{payload["no_actual_data"]:,} zero or missing actual cells excluded as no data. {unmatched:,} unmatched cells. Bias (prediction minus actual): {sum(row["Predicted peak crowd density"] - row["Actual peak crowd density"] for row in rows) / len(rows):+.3f}.')
             if payload["missing_metrics"]:
                 st.warning(f'{payload["missing_metrics"]:,} matching cells were missing a numeric density value.')
@@ -439,8 +443,8 @@ if observed_sources and prediction_source:
 
             result_frame = pd.DataFrame(rows).sort_values("Relative error (%)", ascending=False)
             result_frame["Relative error (%)"] = result_frame["Relative error (%)"].map(lambda value: "Infinity" if math.isinf(value) else f"{value:.2f}%")
-            result_frame["Within 10%"] = result_frame["Within 10%"].map({True: "Yes", False: "No"})
+            result_frame["Within tolerance"] = result_frame["Within tolerance"].map({True: "Yes", False: "No"})
             st.dataframe(result_frame, hide_index=True, width="stretch")
             st.download_button("Download comparison CSV", pd.DataFrame(rows).to_csv(index=False), "peak-crowd-density-comparison.csv", "text/csv")
-            st.caption("A cell counts as accurate when relative error is at most 10%. Zero or missing actual density is treated as no data and excluded from the comparison.")
+            st.caption(f'A cell counts as accurate when relative error is at most {payload["tolerance"]:g}%. Zero or missing actual density is treated as no data and excluded from the comparison.')
 
