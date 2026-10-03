@@ -6,14 +6,24 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 
 st.set_page_config(page_title="Crowd Prediction Validation", layout="wide")
 
-ID_HINTS = ("cell_id", "cellid", "area_id", "areaid", "zone_id", "zoneid", "node_id", "id", "cell", "area")
-CROWD_DENSITY_FIELDS = ("peak_crowd_density", "crowd_density_peak", "max_crowd_density", "crowd_density", "peak_density", "density_peak")
-ARRAY_HINTS = ("vga_floorplan_nodes", "cells", "areas", "zones", "records", "metrics", "items", "data")
+CROWD_DENSITY_FIELDS = ("projected_peak_density", "peak_density", "peak_crowd_density", "crowd_density_peak", "max_crowd_density", "projected_crowd_density", "crowd_density", "density_peak")
+ARRAY_HINTS = ("vga_floorplan_nodes", "floorplan_nodes", "nodes", "cells", "areas", "zones", "records", "metrics", "items", "data")
+DENSITY_SCALE_MAX = 7
+DENSITY_COLORSCALE = [
+    [0.0, "#22c55e"],
+    [1 / DENSITY_SCALE_MAX, "#22c55e"],
+    [2 / DENSITY_SCALE_MAX, "#facc15"],
+    [3 / DENSITY_SCALE_MAX, "#facc15"],
+    [4 / DENSITY_SCALE_MAX, "#f97316"],
+    [5 / DENSITY_SCALE_MAX, "#ef4444"],
+    [1.0, "#b91c1c"],
+]
 
 
 
@@ -42,12 +52,12 @@ def find_record_array(value: Any, path: str = "$", depth: int = 0) -> tuple[str,
     return best_path, best_rows
 
 
-def parse_upload(upload: Any) -> tuple[str, list[dict[str, Any]]]:
+def parse_upload(upload: Any) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     data = json.loads(upload.getvalue().decode("utf-8-sig"))
     found = find_record_array(data)
     if found is None:
         raise ValueError("No non-empty array of JSON objects was found.")
-    return found
+    return found[0], found[1], data
 
 
 def fields_in(records: list[dict[str, Any]]) -> list[str]:
@@ -79,10 +89,13 @@ def find_crowd_density_field(records: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def canonical_value(value: Any) -> str:
+def canonical_value(value: Any, coordinate: bool = False) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
-            return format(Decimal(str(value)).normalize(), "f")
+            number = Decimal(str(value))
+            if coordinate:
+                number = number.quantize(Decimal("0.001"))
+            return format(number.normalize(), "f")
         except InvalidOperation:
             return str(value)
     return str(value).strip()
@@ -92,7 +105,11 @@ def record_key(record: dict[str, Any], key_fields: tuple[str, ...]) -> str | Non
     values = [record.get(field) for field in key_fields]
     if any(value is None or (isinstance(value, str) and not value.strip()) for value in values):
         return None
-    return json.dumps([canonical_value(value) for value in values], ensure_ascii=False)
+    coordinates = {"x", "y", "x_coord", "y_coord", "x_coordinate", "y_coordinate"}
+    return json.dumps(
+        [canonical_value(value, field.lower() in coordinates) for field, value in zip(key_fields, values)],
+        ensure_ascii=False,
+    )
 
 
 def merge_observed(sources: list[tuple[str, list[dict[str, Any]]]], key_fields: tuple[str, ...]) -> tuple[dict[str, dict[str, Any]], int, int, int]:
@@ -131,16 +148,157 @@ def index_records(records: list[dict[str, Any]], key_fields: tuple[str, ...]) ->
     return indexed, duplicates, skipped
 
 
+def find_wall_lines(data: dict[str, Any]) -> list[Any]:
+    for container in (data, data.get("floorplan", {})):
+        if not isinstance(container, dict):
+            continue
+        for field in ("wall_lines", "cad_walls"):
+            lines = container.get(field)
+            if isinstance(lines, list) and lines:
+                return lines
+    return []
+
+
+def find_trajectory_node_ids(data: dict[str, Any]) -> set[str] | None:
+    trajectories = data.get("trajectories")
+    if not isinstance(trajectories, list):
+        return None
+    return {
+        canonical_value(record["grid_node_idx"])
+        for record in trajectories
+        if isinstance(record, dict) and record.get("grid_node_idx") is not None
+    }
+
+
+def make_floorplan_figure(
+    records: list[dict[str, Any]],
+    coordinate_fields: tuple[str, ...],
+    density_field: str,
+    wall_lines: list[Any],
+    unobserved_grid_nodes: set[str],
+) -> go.Figure:
+    wall_x: list[float | None] = []
+    wall_y: list[float | None] = []
+    for segment in wall_lines:
+        if isinstance(segment, dict):
+            xs, ys = segment.get("x"), segment.get("y")
+            if isinstance(xs, list) and isinstance(ys, list) and len(xs) >= 2 and len(ys) >= 2:
+                points = [(xs[0], ys[0]), (xs[-1], ys[-1])]
+            else:
+                continue
+        elif isinstance(segment, list) and len(segment) >= 2:
+            points = [segment[0], segment[-1]]
+        else:
+            continue
+        if not all(isinstance(point, (list, tuple)) and len(point) >= 2 for point in points):
+            continue
+        if not all(is_number(value) for point in points for value in point[:2]):
+            continue
+        wall_x.extend([points[0][0], points[1][0], None])
+        wall_y.extend([points[0][1], points[1][1], None])
+
+    nodes_with_data = []
+    nodes_without_data = []
+    for record in records:
+        if len(coordinate_fields) != 2 or not all(is_number(record.get(field)) for field in coordinate_fields):
+            continue
+        grid_node_idx = record.get("grid_node_idx")
+        density = record.get(density_field)
+        unobserved = (
+            grid_node_idx is not None
+            and canonical_value(grid_node_idx) in unobserved_grid_nodes
+            and (density is None or density == 0)
+        )
+        if unobserved or not is_number(density):
+            nodes_without_data.append(record)
+        else:
+            nodes_with_data.append(record)
+
+    figure = go.Figure()
+    if wall_x:
+        figure.add_trace(
+            go.Scattergl(
+                x=wall_x,
+                y=wall_y,
+                mode="lines",
+                line={"color": "#59645f", "width": 1},
+                hoverinfo="skip",
+                showlegend=False,
+                name="Floorplan walls",
+            )
+        )
+    if nodes_with_data:
+        figure.add_trace(
+            go.Scattergl(
+                x=[record[coordinate_fields[0]] for record in nodes_with_data],
+                y=[record[coordinate_fields[1]] for record in nodes_with_data],
+                mode="markers",
+                marker={
+                    "size": 6,
+                    "color": [record[density_field] for record in nodes_with_data],
+                    "colorscale": DENSITY_COLORSCALE,
+                    "cmin": 0,
+                    "cmax": DENSITY_SCALE_MAX,
+                    "showscale": True,
+                    "colorbar": {
+                        "title": "people / m²",
+                        "tick0": 0,
+                        "dtick": 1,
+                        "len": 0.82,
+                        "lenmode": "fraction",
+                        "thickness": 18,
+                        "thicknessmode": "pixels",
+                        "x": 1.02,
+                        "xanchor": "left",
+                        "y": 0.5,
+                        "yanchor": "middle",
+                        "outlinewidth": 0,
+                    },
+                },
+                hovertemplate="x: %{x:.2f}<br>y: %{y:.2f}<br>peak density: %{marker.color:.3f}<extra></extra>",
+                showlegend=False,
+                name="Grid nodes",
+            )
+        )
+    if nodes_without_data:
+        figure.add_trace(
+            go.Scattergl(
+                x=[record[coordinate_fields[0]] for record in nodes_without_data],
+                y=[record[coordinate_fields[1]] for record in nodes_without_data],
+                mode="markers",
+                marker={"symbol": "circle", "size": 6, "color": "#ffffff", "opacity": 0.2, "line": {"width": 0}},
+                hovertemplate="x: %{x:.2f}<br>y: %{y:.2f}<br>No crowd data<extra></extra>",
+                name="No data",
+            )
+        )
+    figure.update_layout(
+        height=650,
+        margin={"l": 10, "r": 15, "t": 10, "b": 10},
+        xaxis={"title": coordinate_fields[0], "showgrid": False, "zeroline": False},
+        yaxis={"title": coordinate_fields[1], "showgrid": False, "zeroline": False, "scaleanchor": "x", "scaleratio": 1},
+    )
+    return figure
+
+
 st.title("AwanAwam: Crowd Prediction Validation")
 st.write("Combine actual crowd data, review the floorplan, then compare peak crowd density against a prediction.")
 
 st.header("1. Import actual crowd metrics")
 observed_uploads = st.file_uploader("Upload JSON files", type=["json"], accept_multiple_files=True, key="observed_uploads")
 observed_sources: list[tuple[str, list[dict[str, Any]]]] = []
+observed_wall_lines: list[Any] = []
+observed_trajectory_nodes: set[str] = set()
+has_trajectory_data = False
 for upload in observed_uploads or []:
     try:
-        path, records = parse_upload(upload)
+        path, records, data = parse_upload(upload)
         observed_sources.append((upload.name, records))
+        if not observed_wall_lines:
+            observed_wall_lines = find_wall_lines(data)
+        trajectory_nodes = find_trajectory_node_ids(data)
+        if trajectory_nodes is not None:
+            has_trajectory_data = True
+            observed_trajectory_nodes.update(trajectory_nodes)
         st.caption(f"{upload.name}: {len(records):,} rows found at `{path}`")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         st.error(f"{upload.name}: {error}")
@@ -169,7 +327,15 @@ if observed_sources:
     floorplan = pd.DataFrame(floorplan_rows)
     coordinate_fields = find_key_fields(floorplan_rows)
     if coordinate_fields and len(coordinate_fields) == 2 and observed_density_field:
-        st.scatter_chart(floorplan, x=coordinate_fields[0], y=coordinate_fields[1], color=observed_density_field)
+        unobserved_grid_nodes = set()
+        if has_trajectory_data:
+            unobserved_grid_nodes = {
+                canonical_value(record["grid_node_idx"])
+                for record in floorplan_rows
+                if record.get("grid_node_idx") is not None
+                and canonical_value(record["grid_node_idx"]) not in observed_trajectory_nodes
+            }
+        st.plotly_chart(make_floorplan_figure(floorplan_rows, coordinate_fields, observed_density_field, observed_wall_lines, unobserved_grid_nodes))
     st.dataframe(floorplan, hide_index=True, width="stretch")
     st.download_button(
         "Download combined actual data",
@@ -184,7 +350,7 @@ prediction_upload = st.file_uploader("Upload prediction JSON", type=["json"], ke
 prediction_source: tuple[str, list[dict[str, Any]]] | None = None
 if prediction_upload is not None:
     try:
-        path, records = parse_upload(prediction_upload)
+        path, records, _ = parse_upload(prediction_upload)
         prediction_source = (prediction_upload.name, records)
         st.caption(f"{prediction_upload.name}: {len(records):,} rows found at `{path}`")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
