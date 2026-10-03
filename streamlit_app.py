@@ -374,16 +374,20 @@ if observed_sources and prediction_source:
             predictions, duplicate_predictions, skipped_predictions = index_records(predicted_rows, prediction_key_fields)
             results = []
             missing_metric_count = 0
+            no_actual_data_count = 0
             for key, actual_record in merged.items():
                 predicted_record = predictions.get(key)
                 actual = actual_record.get(observed_density_field)
                 predicted = predicted_record.get(prediction_density_field) if predicted_record else None
-                if not is_number(actual) or not is_number(predicted):
+                if not is_number(actual) or actual == 0:
+                    no_actual_data_count += 1
+                    continue
+                if not is_number(predicted):
                     if predicted_record is not None:
                         missing_metric_count += 1
                     continue
                 absolute_error = abs(predicted - actual)
-                relative_error = (0.0 if predicted == 0 else math.inf) if actual == 0 else absolute_error / abs(actual) * 100
+                relative_error = absolute_error / abs(actual) * 100
                 results.append({
                     "Cell key": ", ".join(str(actual_record.get(field, "")) for field in observed_key_fields),
                     "Actual peak crowd density": actual,
@@ -393,7 +397,7 @@ if observed_sources and prediction_source:
                     "Within 10%": relative_error <= 10 or math.isclose(relative_error, 10, rel_tol=1e-12, abs_tol=1e-12),
                 })
             if not results:
-                st.error("No matching cells had numeric peak crowd density values.")
+                    st.error("No matching cells had non-zero actual peak crowd density and numeric predictions.")
             else:
                 errors = [row["Absolute error"] for row in results]
                 nonzero_actual = [row for row in results if row["Actual peak crowd density"] != 0]
@@ -402,6 +406,7 @@ if observed_sources and prediction_source:
                     "duplicates": duplicates,
                     "conflicts": conflicts,
                     "missing_metrics": missing_metric_count,
+                    "no_actual_data": no_actual_data_count,
                     "skipped_observed": skipped_observed,
                     "skipped_prediction": skipped_predictions,
                     "duplicate_predictions": duplicate_predictions,
@@ -426,7 +431,7 @@ if observed_sources and prediction_source:
             cards[1].metric("MAE", f'{payload["mae"]:,.3f}')
             cards[2].metric("RMSE", f'{payload["rmse"]:,.3f}')
             cards[3].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%')
-            st.caption(f"{unmatched:,} unmatched cells. Bias (prediction minus actual): {sum(row['Predicted peak crowd density'] - row['Actual peak crowd density'] for row in rows) / len(rows):+.3f}.")
+            st.caption(f'{payload["no_actual_data"]:,} zero or missing actual cells excluded as no data. {unmatched:,} unmatched cells. Bias (prediction minus actual): {sum(row["Predicted peak crowd density"] - row["Actual peak crowd density"] for row in rows) / len(rows):+.3f}.')
             if payload["missing_metrics"]:
                 st.warning(f'{payload["missing_metrics"]:,} matching cells were missing a numeric density value.')
             if payload["duplicate_predictions"]:
@@ -437,5 +442,5 @@ if observed_sources and prediction_source:
             result_frame["Within 10%"] = result_frame["Within 10%"].map({True: "Yes", False: "No"})
             st.dataframe(result_frame, hide_index=True, width="stretch")
             st.download_button("Download comparison CSV", pd.DataFrame(rows).to_csv(index=False), "peak-crowd-density-comparison.csv", "text/csv")
-            st.caption("A cell counts as accurate when relative error is at most 10%. For actual density zero, only a predicted zero is within tolerance. MAPE excludes zero actual values.")
+            st.caption("A cell counts as accurate when relative error is at most 10%. Zero or missing actual density is treated as no data and excluded from the comparison.")
 

@@ -20,7 +20,7 @@ streamlit run streamlit_app.py
 
 Nested JSON exports are searched for node records, including top-level `nodes` arrays. The observed preview draws the floorplan walls and peak-density-colored grid nodes when the JSON includes coordinates and wall segments. When observed rows overlap, non-empty values from later uploads replace earlier values for the same field; conflicting values are reported. The app processes uploaded files in memory and does not explicitly save them to disk. When hosted remotely, the files are sent to that Streamlit host for processing.
 
-The reported accuracy is the percentage of matched cells within a 10% relative-error tolerance. MAE, RMSE, MAPE, and prediction bias are also shown. MAPE excludes observed values of zero; a zero observed value is within tolerance only when its prediction is also zero.
+The reported accuracy is the percentage of matched cells within a 10% relative-error tolerance. Actual zero or missing peak-density values are treated as no data and excluded from accuracy and error calculations. MAE, RMSE, MAPE, and prediction bias are also shown.
 
 ## Related project
 
