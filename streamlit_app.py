@@ -89,6 +89,20 @@ def find_crowd_density_field(records: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def find_prediction_range_fields(records: list[dict[str, Any]], mean_field: str) -> tuple[str | None, str | None]:
+    normalized = {name.lower().replace("-", "").replace(" ", ""): name for name in fields_in(records)}
+    mean_name = mean_field.lower().replace("-", "").replace(" ", "")
+    return normalized.get(f"{mean_name}_lowest"), normalized.get(f"{mean_name}_highest")
+
+
+def is_within_prediction_range(actual: float, lowest: float, highest: float) -> bool:
+    return (
+        lowest <= actual <= highest
+        or math.isclose(actual, lowest, rel_tol=1e-12, abs_tol=1e-12)
+        or math.isclose(actual, highest, rel_tol=1e-12, abs_tol=1e-12)
+    )
+
+
 def canonical_value(value: Any, coordinate: bool = False) -> str:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
@@ -177,7 +191,7 @@ def make_floorplan_figure(
     wall_lines: list[Any],
     unobserved_grid_nodes: set[str],
     comparison_keys: set[str] | None = None,
-    actual_exceeds_prediction_keys: set[str] | None = None,
+    out_of_prediction_range_keys: set[str] | None = None,
 ) -> go.Figure:
     wall_x: list[float | None] = []
     wall_y: list[float | None] = []
@@ -201,18 +215,18 @@ def make_floorplan_figure(
 
     nodes_with_data = []
     nodes_without_data = []
-    nodes_over_predicted = []
-    nodes_not_over_predicted = []
+    nodes_outside_prediction_range = []
+    nodes_within_prediction_range = []
     for record in records:
         if len(coordinate_fields) != 2 or not all(is_number(record.get(field)) for field in coordinate_fields):
             continue
         if comparison_keys is not None:
             key = record_key(record, coordinate_fields)
             if key in comparison_keys:
-                if key in (actual_exceeds_prediction_keys or set()):
-                    nodes_over_predicted.append(record)
+                if key in (out_of_prediction_range_keys or set()):
+                    nodes_outside_prediction_range.append(record)
                 else:
-                    nodes_not_over_predicted.append(record)
+                    nodes_within_prediction_range.append(record)
             else:
                 nodes_without_data.append(record)
             continue
@@ -270,26 +284,26 @@ def make_floorplan_figure(
                 name="Grid nodes",
             )
         )
-    if comparison_keys is not None and nodes_not_over_predicted:
+    if comparison_keys is not None and nodes_within_prediction_range:
         figure.add_trace(
             go.Scattergl(
-                x=[record[coordinate_fields[0]] for record in nodes_not_over_predicted],
-                y=[record[coordinate_fields[1]] for record in nodes_not_over_predicted],
+                x=[record[coordinate_fields[0]] for record in nodes_within_prediction_range],
+                y=[record[coordinate_fields[1]] for record in nodes_within_prediction_range],
                 mode="markers",
                 marker={"size": 6, "color": "#98a19d", "opacity": 0.55},
-                hovertemplate="x: %{x:.2f}<br>y: %{y:.2f}<br>Actual did not exceed prediction<extra></extra>",
-                name="Actual ≤ predicted",
+                hovertemplate="x: %{x:.2f}<br>y: %{y:.2f}<br>Actual within predicted range<extra></extra>",
+                name="Within predicted range",
             )
         )
-    if comparison_keys is not None and nodes_over_predicted:
+    if comparison_keys is not None and nodes_outside_prediction_range:
         figure.add_trace(
             go.Scattergl(
-                x=[record[coordinate_fields[0]] for record in nodes_over_predicted],
-                y=[record[coordinate_fields[1]] for record in nodes_over_predicted],
+                x=[record[coordinate_fields[0]] for record in nodes_outside_prediction_range],
+                y=[record[coordinate_fields[1]] for record in nodes_outside_prediction_range],
                 mode="markers",
                 marker={"size": 7, "color": "#e53935", "opacity": 0.95},
-                hovertemplate="x: %{x:.2f}<br>y: %{y:.2f}<br>Actual exceeded prediction<extra></extra>",
-                name="Actual > predicted",
+                hovertemplate="x: %{x:.2f}<br>y: %{y:.2f}<br>Actual outside predicted range<extra></extra>",
+                name="Outside predicted range",
             )
         )
     if nodes_without_data:
@@ -397,118 +411,141 @@ if observed_sources and prediction_source:
     elif not observed_density_field or not prediction_density_field:
         st.warning("Could not find a peak crowd density field in both datasets.")
     else:
-        tolerance = st.number_input("Accuracy tolerance (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
-        st.caption(f"Comparing `{observed_density_field}` with `{prediction_density_field}`. Cell matching is automatic using {', '.join(observed_key_fields)}.")
-        signatures = (
-            tuple((upload.name, hash(upload.getvalue())) for upload in observed_uploads or []),
-            (prediction_upload.name, hash(prediction_upload.getvalue())),
-            tolerance,
+        prediction_low_field, prediction_high_field = find_prediction_range_fields(
+            predicted_rows, prediction_density_field
         )
-        if st.button("Compare peak crowd density", type="primary"):
-            predictions, duplicate_predictions, skipped_predictions = index_records(predicted_rows, prediction_key_fields)
-            results = []
-            comparison_keys = set()
-            actual_exceeds_prediction_keys = set()
-            missing_metric_count = 0
-            no_actual_data_count = 0
-            for key, actual_record in merged.items():
-                predicted_record = predictions.get(key)
-                actual = actual_record.get(observed_density_field)
-                predicted = predicted_record.get(prediction_density_field) if predicted_record else None
-                if not is_number(actual) or actual == 0:
-                    no_actual_data_count += 1
-                    continue
-                if not is_number(predicted):
-                    if predicted_record is not None:
-                        missing_metric_count += 1
-                    continue
-                absolute_error = abs(predicted - actual)
-                relative_error = absolute_error / abs(actual) * 100
-                comparison_keys.add(key)
-                if actual > predicted:
-                    actual_exceeds_prediction_keys.add(key)
-                results.append({
-                    "Cell key": ", ".join(str(actual_record.get(field, "")) for field in observed_key_fields),
-                    "Actual peak crowd density": actual,
-                    "Predicted peak crowd density": predicted,
-                    "Absolute error": absolute_error,
-                    "Relative error (%)": relative_error,
-                    "Within tolerance": relative_error <= tolerance or math.isclose(relative_error, tolerance, rel_tol=1e-12, abs_tol=1e-12),
-                })
-            if not results:
-                    st.error("No matching cells had non-zero actual peak crowd density and numeric predictions.")
-            else:
-                errors = [row["Absolute error"] for row in results]
-                nonzero_actual = [row for row in results if row["Actual peak crowd density"] != 0]
-                payload = {
-                    "rows": results,
-                    "duplicates": duplicates,
-                    "conflicts": conflicts,
-                    "missing_metrics": missing_metric_count,
-                    "no_actual_data": no_actual_data_count,
-                    "skipped_observed": skipped_observed,
-                    "skipped_prediction": skipped_predictions,
-                    "duplicate_predictions": duplicate_predictions,
-                    "tolerance": tolerance,
-                    "comparison_keys": list(comparison_keys),
-                    "actual_exceeds_prediction_keys": list(actual_exceeds_prediction_keys),
-                    "mae": sum(errors) / len(errors),
-                    "rmse": math.sqrt(sum(error * error for error in errors) / len(errors)),
-                    "mape": sum(row["Relative error (%)"] for row in nonzero_actual) / len(nonzero_actual) if nonzero_actual else None,
-                    "pass_count": sum(row["Within tolerance"] for row in results),
-                }
-                st.session_state["comparison_payload"] = payload
-                st.session_state["comparison_signature"] = signatures
-
-        payload = st.session_state.get("comparison_payload")
-        if payload and st.session_state.get("comparison_signature") == signatures:
-            rows = payload["rows"]
-            accuracy = payload["pass_count"] / len(rows) * 100
-            mean_actual_density = sum(abs(row["Actual peak crowd density"]) for row in rows) / len(rows)
-            mae_of_mean_percent = payload["mae"] / mean_actual_density * 100
-            rmse_of_mean_percent = payload["rmse"] / mean_actual_density * 100
-            prediction_keys, _, _ = index_records(predicted_rows, prediction_key_fields)
-            actual_keys = set(merged)
-            unmatched = len(actual_keys - prediction_keys.keys()) + len(prediction_keys.keys() - actual_keys)
-            actual_exceeds_count = sum(row["Actual peak crowd density"] > row["Predicted peak crowd density"] for row in rows)
-            actual_exceeds_percent = actual_exceeds_count / len(rows) * 100
-            st.subheader("Results")
-            cards = st.columns(5)
-            cards[0].metric(f'Within {payload["tolerance"]:g}% tolerance', f"{accuracy:.1f}%", f'{payload["pass_count"]:,} / {len(rows):,} matched cells')
-            cards[1].metric("Actual > predicted", f"{actual_exceeds_percent:.1f}%", f"{actual_exceeds_count:,} / {len(rows):,} valid cells")
-            cards[2].metric("MAE", f'{payload["mae"]:,.3f}', help=f'Mean Absolute Error in people/m². This is {mae_of_mean_percent:.1f}% of mean actual density.')
-            cards[3].metric("RMSE", f'{payload["rmse"]:,.3f}', help=f'Root Mean Squared Error in people/m²; larger errors count more. This is {rmse_of_mean_percent:.1f}% of mean actual density.')
-            cards[4].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%', help="Mean Absolute Percentage Error: average absolute error as a percentage of actual density. Zero actual values are excluded.")
-            st.markdown(
-                "**Rule-of-thumb reference, not universal acceptance limits:** "
-                f"MAE is **{mae_of_mean_percent:.1f}%** and RMSE is **{rmse_of_mean_percent:.1f}%** of mean actual density "
-                "(<10% low, 10–20% moderate, >20% high). "
-                "MAPE: <10% very good, 10–20% good, 20–50% fair, >50% poor. "
-                "Acceptable error depends on the use case; MAPE can be unstable for very small actual values."
+        if not prediction_low_field or not prediction_high_field:
+            st.warning(
+                "The prediction JSON must include the matching "
+                f"`{prediction_density_field}_lowest` and "
+                f"`{prediction_density_field}_highest` fields for range validation."
             )
-            st.caption(f'{payload["no_actual_data"]:,} zero or missing actual cells excluded as no data. {unmatched:,} unmatched cells. Bias (prediction minus actual): {sum(row["Predicted peak crowd density"] - row["Actual peak crowd density"] for row in rows) / len(rows):+.3f}.')
-            if payload["missing_metrics"]:
-                st.warning(f'{payload["missing_metrics"]:,} matching cells were missing a numeric density value.')
-            if payload["duplicate_predictions"]:
-                st.caption(f'{payload["duplicate_predictions"]:,} repeated prediction keys; the last row was used.')
+        else:
+            st.caption(
+                f"Comparing `{observed_density_field}` with the mean "
+                f"`{prediction_density_field}` and its predicted range. "
+                f"Cell matching is automatic using {', '.join(observed_key_fields)}."
+            )
+            signatures = (
+                tuple((upload.name, hash(upload.getvalue())) for upload in observed_uploads or []),
+                (prediction_upload.name, hash(prediction_upload.getvalue())),
+            )
+            if st.button("Compare peak crowd density", type="primary"):
+                predictions, duplicate_predictions, skipped_predictions = index_records(predicted_rows, prediction_key_fields)
+                results = []
+                comparison_keys = set()
+                out_of_prediction_range_keys = set()
+                missing_metric_count = 0
+                no_actual_data_count = 0
+                for key, actual_record in merged.items():
+                    predicted_record = predictions.get(key)
+                    actual = actual_record.get(observed_density_field)
+                    predicted_mean = predicted_record.get(prediction_density_field) if predicted_record else None
+                    predicted_lowest = predicted_record.get(prediction_low_field) if predicted_record else None
+                    predicted_highest = predicted_record.get(prediction_high_field) if predicted_record else None
+                    if not is_number(actual) or actual == 0:
+                        no_actual_data_count += 1
+                        continue
+                    if (
+                        not is_number(predicted_mean)
+                        or not is_number(predicted_lowest)
+                        or not is_number(predicted_highest)
+                        or predicted_lowest > predicted_highest
+                        or not predicted_lowest <= predicted_mean <= predicted_highest
+                    ):
+                        if predicted_record is not None:
+                            missing_metric_count += 1
+                        continue
+                    absolute_error = abs(predicted_mean - actual)
+                    relative_error = absolute_error / abs(actual) * 100
+                    within_range = is_within_prediction_range(
+                        actual, predicted_lowest, predicted_highest
+                    )
+                    comparison_keys.add(key)
+                    if not within_range:
+                        out_of_prediction_range_keys.add(key)
+                    results.append({
+                        "Cell key": ", ".join(str(actual_record.get(field, "")) for field in observed_key_fields),
+                        "Actual peak crowd density": actual,
+                        "Predicted peak crowd density (mean)": predicted_mean,
+                        "Predicted peak crowd density (lowest)": predicted_lowest,
+                        "Predicted peak crowd density (highest)": predicted_highest,
+                        "Absolute error": absolute_error,
+                        "Relative error (%)": relative_error,
+                        "Within predicted range": within_range,
+                    })
+                if not results:
+                    st.error("No matching cells had non-zero actual density and valid predicted ranges.")
+                else:
+                    errors = [row["Absolute error"] for row in results]
+                    nonzero_actual = [row for row in results if row["Actual peak crowd density"] != 0]
+                    payload = {
+                        "rows": results,
+                        "duplicates": duplicates,
+                        "conflicts": conflicts,
+                        "missing_metrics": missing_metric_count,
+                        "no_actual_data": no_actual_data_count,
+                        "skipped_observed": skipped_observed,
+                        "skipped_prediction": skipped_predictions,
+                        "duplicate_predictions": duplicate_predictions,
+                        "comparison_keys": list(comparison_keys),
+                        "out_of_prediction_range_keys": list(out_of_prediction_range_keys),
+                        "mae": sum(errors) / len(errors),
+                        "rmse": math.sqrt(sum(error * error for error in errors) / len(errors)),
+                        "mape": sum(row["Relative error (%)"] for row in nonzero_actual) / len(nonzero_actual) if nonzero_actual else None,
+                        "pass_count": sum(row["Within predicted range"] for row in results),
+                    }
+                    st.session_state["comparison_payload"] = payload
+                    st.session_state["comparison_signature"] = signatures
 
-            if len(observed_key_fields) == 2:
-                st.subheader("Cells where actual density exceeds prediction")
-                comparison_figure = make_floorplan_figure(
-                    list(merged.values()),
-                    observed_key_fields,
-                    observed_density_field,
-                    observed_wall_lines,
-                    unobserved_grid_nodes,
-                    set(payload["comparison_keys"]),
-                    set(payload["actual_exceeds_prediction_keys"]),
+            payload = st.session_state.get("comparison_payload")
+            if payload and st.session_state.get("comparison_signature") == signatures:
+                rows = payload["rows"]
+                accuracy = payload["pass_count"] / len(rows) * 100
+                mean_actual_density = sum(abs(row["Actual peak crowd density"]) for row in rows) / len(rows)
+                mae_of_mean_percent = payload["mae"] / mean_actual_density * 100
+                rmse_of_mean_percent = payload["rmse"] / mean_actual_density * 100
+                prediction_keys, _, _ = index_records(predicted_rows, prediction_key_fields)
+                actual_keys = set(merged)
+                unmatched = len(actual_keys - prediction_keys.keys()) + len(prediction_keys.keys() - actual_keys)
+                out_of_range_count = len(payload["out_of_prediction_range_keys"])
+                out_of_range_percent = out_of_range_count / len(rows) * 100
+                st.subheader("Results")
+                cards = st.columns(5)
+                cards[0].metric("Within predicted range", f"{accuracy:.1f}%", f'{payload["pass_count"]:,} / {len(rows):,} matched cells')
+                cards[1].metric("Outside predicted range", f"{out_of_range_percent:.1f}%", f"{out_of_range_count:,} / {len(rows):,} valid cells")
+                cards[2].metric("MAE", f'{payload["mae"]:,.3f}', help=f'Mean Absolute Error in people/m². This is {mae_of_mean_percent:.1f}% of mean actual density.')
+                cards[3].metric("RMSE", f'{payload["rmse"]:,.3f}', help=f'Root Mean Squared Error in people/m²; larger errors count more. This is {rmse_of_mean_percent:.1f}% of mean actual density.')
+                cards[4].metric("MAPE", "—" if payload["mape"] is None else f'{payload["mape"]:,.2f}%', help="Mean Absolute Percentage Error: average absolute error as a percentage of actual density. Zero actual values are excluded.")
+                st.markdown(
+                    "**Rule-of-thumb reference, not universal acceptance limits:** "
+                    f"MAE is **{mae_of_mean_percent:.1f}%** and RMSE is **{rmse_of_mean_percent:.1f}%** of mean actual density "
+                    "(<10% low, 10–20% moderate, >20% high). "
+                    "MAPE: <10% very good, 10–20% good, 20–50% fair, >50% poor. "
+                    "Acceptable error depends on the use case; MAPE can be unstable for very small actual values."
                 )
-                st.plotly_chart(comparison_figure)
+                st.caption(f'{payload["no_actual_data"]:,} zero or missing actual cells excluded as no data. {unmatched:,} unmatched cells. Bias (prediction mean minus actual): {sum(row["Predicted peak crowd density (mean)"] - row["Actual peak crowd density"] for row in rows) / len(rows):+.3f}.')
+                if payload["missing_metrics"]:
+                    st.warning(f'{payload["missing_metrics"]:,} matching cells were missing a numeric mean or valid predicted range.')
+                if payload["duplicate_predictions"]:
+                    st.caption(f'{payload["duplicate_predictions"]:,} repeated prediction keys; the last row was used.')
 
-            result_frame = pd.DataFrame(rows).sort_values("Relative error (%)", ascending=False)
-            result_frame["Relative error (%)"] = result_frame["Relative error (%)"].map(lambda value: "Infinity" if math.isinf(value) else f"{value:.2f}%")
-            result_frame["Within tolerance"] = result_frame["Within tolerance"].map({True: "Yes", False: "No"})
-            st.dataframe(result_frame, hide_index=True, width="stretch")
-            st.download_button("Download comparison CSV", pd.DataFrame(rows).to_csv(index=False), "peak-crowd-density-comparison.csv", "text/csv")
-            st.caption(f'A cell counts as accurate when relative error is at most {payload["tolerance"]:g}%. Zero or missing actual density is treated as no data and excluded from the comparison.')
+                if len(observed_key_fields) == 2:
+                    st.subheader("Cells outside the predicted range")
+                    comparison_figure = make_floorplan_figure(
+                        list(merged.values()),
+                        observed_key_fields,
+                        observed_density_field,
+                        observed_wall_lines,
+                        unobserved_grid_nodes,
+                        set(payload["comparison_keys"]),
+                        set(payload["out_of_prediction_range_keys"]),
+                    )
+                    st.plotly_chart(comparison_figure)
 
+                result_frame = pd.DataFrame(rows).sort_values("Relative error (%)", ascending=False)
+                result_frame["Relative error (%)"] = result_frame["Relative error (%)"].map(lambda value: "Infinity" if math.isinf(value) else f"{value:.2f}%")
+                result_frame["Within predicted range"] = result_frame["Within predicted range"].map({True: "Yes", False: "No"})
+                st.dataframe(result_frame, hide_index=True, width="stretch")
+                st.download_button("Download comparison CSV", pd.DataFrame(rows).to_csv(index=False), "peak-crowd-density-comparison.csv", "text/csv")
+                st.caption("A cell counts as accurate when its actual density is between the predicted lowest and highest values (mean ± 1 weighted standard deviation). Zero or missing actual density is treated as no data and excluded from the comparison.")
