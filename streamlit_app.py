@@ -370,6 +370,21 @@ if observed_sources:
         floorplan_rows = [record for _, records in observed_sources for record in records]
         st.warning("No coordinate pair or cell ID was found. Showing all rows, but they cannot be merged or compared automatically.")
 
+    if observed_density_field:
+        nodes_with_crowd_data = sum(
+            1
+            for record in floorplan_rows
+            if is_number(record.get(observed_density_field)) and record[observed_density_field] != 0
+        )
+        total_nodes = len(floorplan_rows)
+        coverage = nodes_with_crowd_data / total_nodes * 100 if total_nodes else None
+        st.metric(
+            "VGA nodes with crowd data",
+            "—" if coverage is None else f"{coverage:.1f}%",
+            help="Zero or missing crowd-density values are treated as no data, consistent with comparison results.",
+        )
+        st.caption(f"{nodes_with_crowd_data:,} / {total_nodes:,} VGA nodes")
+
     floorplan = pd.DataFrame(floorplan_rows)
     coordinate_fields = find_key_fields(floorplan_rows)
     if coordinate_fields and len(coordinate_fields) == 2 and observed_density_field:
